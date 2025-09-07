@@ -1,22 +1,29 @@
 // OpenRouter API Configuration
 const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const STORAGE_API_URL = '/.netlify/functions/chat-storage';
 
 // Application State
 let state = {
-    apiKey: localStorage.getItem('openrouter_api_key') || '',
+    apiKey: '',
     currentModel: localStorage.getItem('selected_model') || 'openai/gpt-3.5-turbo',
-    chatHistory: JSON.parse(localStorage.getItem('chat_history')) || [],
+    chatHistory: [],
     currentChatId: null,
     messages: [],
     totalTokens: 0,
     settings: {
-        maxTokens: parseInt(localStorage.getItem('max_tokens')) || 2000,
-        temperature: parseFloat(localStorage.getItem('temperature')) || 0.7,
-        showTimestamps: localStorage.getItem('show_timestamps') !== 'false',
-        soundEnabled: localStorage.getItem('sound_enabled') === 'true'
+        maxTokens: 2000,
+        temperature: 0.7,
+        showTimestamps: true,
+        soundEnabled: false
     },
-    availableModels: []
+    availableModels: [],
+    userId: localStorage.getItem('user_id') || 'user_' + Date.now()
 };
+
+// Save user ID to localStorage for persistence
+if (!localStorage.getItem('user_id')) {
+    localStorage.setItem('user_id', state.userId);
+}
 
 // DOM Elements
 const elements = {
@@ -47,11 +54,55 @@ const elements = {
     loadingOverlay: document.getElementById('loadingOverlay')
 };
 
+// Storage API Helper Functions
+async function apiCall(url, options = {}) {
+    try {
+        const response = await fetch(url, {
+            ...options,
+            headers: {
+                'Content-Type': 'application/json',
+                ...options.headers
+            }
+        });
+        const data = await response.json();
+        if (!data.success) {
+            throw new Error(data.error || 'API call failed');
+        }
+        return data.data;
+    } catch (error) {
+        console.error('API call error:', error);
+        throw error;
+    }
+}
+
+async function loadFromStorage(action) {
+    const url = `${STORAGE_API_URL}?userId=${state.userId}&action=${action}`;
+    return await apiCall(url);
+}
+
+async function saveToStorage(action, data) {
+    const url = `${STORAGE_API_URL}?userId=${state.userId}&action=${action}`;
+    return await apiCall(url, {
+        method: 'POST',
+        body: JSON.stringify(data)
+    });
+}
+
+async function deleteFromStorage(action, params = {}) {
+    const queryParams = new URLSearchParams({
+        userId: state.userId,
+        action,
+        ...params
+    });
+    const url = `${STORAGE_API_URL}?${queryParams}`;
+    return await apiCall(url, { method: 'DELETE' });
+}
+
 // Initialize Application
 async function init() {
     loadTheme();
-    loadSettings();
-    loadChatHistory();
+    await loadSettings();
+    await loadChatHistory();
     setupEventListeners();
     
     if (state.apiKey) {
@@ -256,7 +307,7 @@ async function sendMessage() {
         );
         
         // Save to history
-        updateChatHistory();
+        await updateChatHistory();
         
         // Play sound if enabled
         if (state.settings.soundEnabled) {
@@ -306,7 +357,7 @@ function addMessageToChat(role, content) {
 }
 
 // Start new chat
-function startNewChat() {
+async function startNewChat() {
     state.messages = [];
     state.currentChatId = Date.now().toString();
     state.totalTokens = 0;
@@ -335,11 +386,11 @@ function startNewChat() {
         </div>
     `;
     
-    updateChatHistory();
+    await updateChatHistory();
 }
 
 // Update chat history
-function updateChatHistory() {
+async function updateChatHistory() {
     if (!state.currentChatId) {
         state.currentChatId = Date.now().toString();
     }
@@ -364,8 +415,13 @@ function updateChatHistory() {
         state.chatHistory = state.chatHistory.slice(0, 50);
     }
     
-    localStorage.setItem('chat_history', JSON.stringify(state.chatHistory));
-    renderChatHistory();
+    try {
+        await saveToStorage('save-chat', chatData);
+        renderChatHistory();
+    } catch (error) {
+        console.error('Failed to save chat:', error);
+        showNotification('Failed to save chat to server', 'error');
+    }
 }
 
 // Render chat history in sidebar
@@ -404,8 +460,15 @@ function loadChat(chatId) {
 }
 
 // Load chat history from localStorage
-function loadChatHistory() {
-    renderChatHistory();
+async function loadChatHistory() {
+    try {
+        state.chatHistory = await loadFromStorage('history') || [];
+        renderChatHistory();
+    } catch (error) {
+        console.error('Failed to load chat history:', error);
+        state.chatHistory = [];
+        renderChatHistory();
+    }
 }
 
 // Export chat
@@ -434,19 +497,24 @@ function exportChat() {
 }
 
 // Clear all chats
-function clearAllChats() {
+async function clearAllChats() {
     if (confirm('Are you sure you want to clear all chat history? This cannot be undone.')) {
-        state.chatHistory = [];
-        state.messages = [];
-        state.currentChatId = null;
-        state.totalTokens = 0;
-        elements.tokenCount.textContent = '0';
-        
-        localStorage.removeItem('chat_history');
-        renderChatHistory();
-        startNewChat();
-        
-        showNotification('All chats cleared', 'success');
+        try {
+            await deleteFromStorage('clear-history');
+            state.chatHistory = [];
+            state.messages = [];
+            state.currentChatId = null;
+            state.totalTokens = 0;
+            elements.tokenCount.textContent = '0';
+            
+            renderChatHistory();
+            await startNewChat();
+            
+            showNotification('All chats cleared', 'success');
+        } catch (error) {
+            console.error('Failed to clear chat history:', error);
+            showNotification('Failed to clear chat history', 'error');
+        }
     }
 }
 
@@ -479,29 +547,51 @@ async function saveSettings() {
     state.settings.showTimestamps = elements.showTimestamps.checked;
     state.settings.soundEnabled = elements.soundEnabled.checked;
     
-    // Save to localStorage
-    localStorage.setItem('openrouter_api_key', state.apiKey);
-    localStorage.setItem('max_tokens', state.settings.maxTokens);
-    localStorage.setItem('temperature', state.settings.temperature);
-    localStorage.setItem('show_timestamps', state.settings.showTimestamps);
-    localStorage.setItem('sound_enabled', state.settings.soundEnabled);
-    
-    hideSettingsModal();
-    showNotification('Settings saved successfully', 'success');
-    
-    // Reload models with new API key
-    await loadAvailableModels();
+    try {
+        // Save settings to Netlify Blobs
+        await saveToStorage('save-settings', {
+            apiKey: state.apiKey,
+            maxTokens: state.settings.maxTokens,
+            temperature: state.settings.temperature,
+            showTimestamps: state.settings.showTimestamps,
+            soundEnabled: state.settings.soundEnabled
+        });
+        
+        hideSettingsModal();
+        showNotification('Settings saved successfully', 'success');
+        
+        // Reload models with new API key
+        await loadAvailableModels();
+    } catch (error) {
+        console.error('Failed to save settings:', error);
+        showNotification('Failed to save settings to server', 'error');
+    }
 }
 
-function loadSettings() {
-    if (state.apiKey) {
-        elements.apiKey.value = state.apiKey;
+async function loadSettings() {
+    try {
+        const settings = await loadFromStorage('settings') || {};
+        
+        // Update state with loaded settings
+        if (settings.apiKey) state.apiKey = settings.apiKey;
+        if (settings.maxTokens) state.settings.maxTokens = settings.maxTokens;
+        if (settings.temperature !== undefined) state.settings.temperature = settings.temperature;
+        if (settings.showTimestamps !== undefined) state.settings.showTimestamps = settings.showTimestamps;
+        if (settings.soundEnabled !== undefined) state.settings.soundEnabled = settings.soundEnabled;
+        
+        // Update UI elements
+        if (state.apiKey) {
+            elements.apiKey.value = state.apiKey;
+        }
+        elements.maxTokens.value = state.settings.maxTokens;
+        elements.temperature.value = state.settings.temperature;
+        elements.tempValue.textContent = state.settings.temperature;
+        elements.showTimestamps.checked = state.settings.showTimestamps;
+        elements.soundEnabled.checked = state.settings.soundEnabled;
+    } catch (error) {
+        console.error('Failed to load settings:', error);
+        // Use defaults if loading fails
     }
-    elements.maxTokens.value = state.settings.maxTokens;
-    elements.temperature.value = state.settings.temperature;
-    elements.tempValue.textContent = state.settings.temperature;
-    elements.showTimestamps.checked = state.settings.showTimestamps;
-    elements.soundEnabled.checked = state.settings.soundEnabled;
 }
 
 // Theme functions
